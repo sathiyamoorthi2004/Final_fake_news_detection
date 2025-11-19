@@ -1,8 +1,9 @@
 # app.py
-# Robust Fake News Detector (text + optional image OCR)
-# - Place news_model.pkl and vectorizer.pkl in same folder to enable predictions.
-# - Optional packages: pytesseract, opencv-python (cv2), transformers/torch (image caption)
-# - If tesseract is not installed OCR is disabled to avoid crashes on cloud.
+# Fake News Detector (text + optional image OCR)
+# - Uses EasyOCR on cloud (if installed) or pytesseract locally as fallback.
+# - Put news_model.pkl and vectorizer.pkl in same folder to enable predictions.
+# - Requirements (add to requirements.txt): streamlit, pillow, scikit-learn, easyocr, opencv-python-headless
+#   (torch will be installed as a dependency of easyocr).
 
 import os
 import re
@@ -10,15 +11,16 @@ import string
 import pickle
 import difflib
 from io import BytesIO
-from typing import Tuple, List
+from typing import Tuple
 
 from PIL import Image, ImageEnhance, ImageFilter
+import numpy as np
 
 import streamlit as st
 from sklearn.utils.validation import check_is_fitted
 
 # -------------------------
-# optional packages (safe imports)
+# Optional packages (safe imports)
 # -------------------------
 # cv2 (OpenCV) - used for advanced preprocessing. If missing fall back to PIL-only tweaks.
 try:
@@ -27,28 +29,35 @@ try:
 except Exception:
     CV2_AVAILABLE = False
 
-# pytesseract - only enable OCR if tesseract binary exists on PATH
+# Try EasyOCR first (best for cloud). If not installed, we'll try pytesseract (local).
+EASYOCR_AVAILABLE = False
+PYTESSERACT_AVAILABLE = False
+try:
+    import easyocr
+    # create reader lazily later (so startup is faster in environments where not used)
+    EASYOCR_AVAILABLE = True
+except Exception:
+    EASYOCR_AVAILABLE = False
+
 try:
     import pytesseract
     import shutil
-    # if system has tesseract executable, enable OCR; otherwise keep disabled to avoid cloud errors
+    # enable pytesseract only if tesseract binary is found (local)
     TESS_BIN = shutil.which("tesseract")
     if TESS_BIN:
         pytesseract.pytesseract.tesseract_cmd = TESS_BIN
-        OCR_AVAILABLE = True
-    else:
-        OCR_AVAILABLE = False
+        PYTESSERACT_AVAILABLE = True
 except Exception:
-    OCR_AVAILABLE = False
+    PYTESSERACT_AVAILABLE = False
 
-# transformers/torch (optional heavy features). We'll not fail app if missing.
-TRY_TRANSFORMERS = False
-try:
-    from transformers import BlipProcessor, BlipForConditionalGeneration
-    import torch
-    TRY_TRANSFORMERS = True
-except Exception:
-    TRY_TRANSFORMERS = False
+# Decide final OCR availability: prefer EasyOCR if available, otherwise pytesseract (local)
+OCR_BACKEND = None
+if EASYOCR_AVAILABLE:
+    OCR_BACKEND = "easyocr"
+elif PYTESSERACT_AVAILABLE:
+    OCR_BACKEND = "pytesseract"
+else:
+    OCR_BACKEND = None
 
 # -------------------------
 # Files & config
@@ -137,7 +146,7 @@ def predict_with_checks(raw_text: str) -> dict:
     return {"ok": True, "cleaned": cleaned, "prediction": "REAL" if int(pred) == 1 else "FAKE", "prob": prob, "low_confidence": low_conf}
 
 # -------------------------
-# OCR helpers (PIL-only fallback + optional OpenCV variants)
+# OCR helpers
 # -------------------------
 def normalize_ocr_text(s: str) -> str:
     s = s or ""
@@ -154,76 +163,100 @@ def pil_enhance_basic(pil_img: Image.Image) -> Image.Image:
     img = img.filter(ImageFilter.MedianFilter(size=3))
     return img
 
-# if OpenCV is available, provide a richer set of variants; otherwise use a few PIL variants
-def try_ocr_variants(pil_img: Image.Image, tesseract_config: str = "--oem 3 --psm 6") -> Tuple[str, str]:
-    """
-    Try multiple preprocessing variants. Returns (extracted_text, method_name).
-    If nothing found returns ("", "none_found").
-    """
-    variants = []
-    # base (resized if small)
+# EasyOCR extraction helper
+def easyocr_extract_text(reader, pil_img: Image.Image) -> str:
+    # convert to RGB numpy
+    arr = np.array(pil_img.convert("RGB"))
+    # easyocr returns list of (bbox, text, confidence)
+    try:
+        results = reader.readtext(arr, detail=1)
+        texts = [r[1] for r in results if len(r) >= 2 and r[1].strip() != ""]
+        joined = " ".join(texts)
+        return normalize_ocr_text(joined)
+    except Exception:
+        return ""
+
+# pytesseract extraction helper
+def pytess_extract_text(pil_img: Image.Image, config: str = "--oem 3 --psm 6") -> str:
+    try:
+        txt = pytesseract.image_to_string(pil_img, config=config)
+        return normalize_ocr_text(txt)
+    except Exception:
+        return ""
+
+# Try a few preprocessing variants and attempt OCR
+def try_ocr_variants(pil_img: Image.Image) -> Tuple[str, str]:
+    """Return (extracted_text, method_name). empty text if none found."""
+    # resize if small
     w, h = pil_img.size
     if w < 1000:
-        pil_big = pil_img.resize((1000, int(h * (1000 / w))), Image.LANCZOS)
+        big = pil_img.resize((1000, int(h * (1000 / w))), Image.LANCZOS)
     else:
-        pil_big = pil_img.copy()
-    variants.append(("orig_resized", pil_big))
+        big = pil_img.copy()
 
-    # PIL enhanced (contrast + sharpen)
-    variants.append(("pil_enhanced", pil_enhance_basic(pil_big)))
+    variants = [("orig_resized", big), ("enhanced", pil_enhance_basic(big))]
 
-    # small crop center (sometimes headline sits center)
+    # center crop variant
     try:
-        cw, ch = pil_big.size[0]//3, pil_big.size[1]//6
-        crop = pil_big.crop((cw, ch, pil_big.size[0]-cw, pil_big.size[1]-ch))
+        cw, ch = big.size[0] // 4, big.size[1] // 6
+        crop = big.crop((cw, ch, big.size[0] - cw, big.size[1] - ch))
         variants.append(("center_crop", crop))
-        variants.append(("center_crop_enhanced", pil_enhance_basic(crop)))
+        variants.append(("center_crop_enh", pil_enhance_basic(crop)))
     except Exception:
         pass
 
-    # If OpenCV available, add deskew and adaptive threshold variants
+    # OpenCV deskew / adapt if available (optional)
     if CV2_AVAILABLE:
-        import numpy as np
-        def cv_from_pil(p):
-            return cv2.cvtColor(np.array(p), cv2.COLOR_RGB2BGR)
-        def pil_from_cv(c):
-            return Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB))
-
-        base_cv = cv_from_pil(pil_big)
-        # deskew
-        gray = cv2.cvtColor(base_cv, cv2.COLOR_BGR2GRAY)
-        coords = cv2.findNonZero(cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)[1])
-        if coords is not None and len(coords) > 10:
-            angle = cv2.minAreaRect(coords)[-1]
-            if angle < -45:
-                angle = -(90 + angle)
-            else:
-                angle = -angle
-            (hcv, wcv) = base_cv.shape[:2]
-            M = cv2.getRotationMatrix2D((wcv // 2, hcv // 2), angle, 1.0)
-            rotated = cv2.warpAffine(base_cv, M, (wcv, hcv), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            variants.append(("cv_deskew", pil_from_cv(rotated)))
-            # adaptive threshold variant
-            adap = cv2.adaptiveThreshold(cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY), 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                         cv2.THRESH_BINARY, 25, 9)
-            variants.append(("cv_deskew_adapt", pil_from_cv(cv2.cvtColor(adap, cv2.COLOR_GRAY2BGR))))
-        # morphological close/denoise
-        den = cv2.medianBlur(gray, 3)
-        variants.append(("cv_median", pil_from_cv(cv2.cvtColor(den, cv2.COLOR_GRAY2BGR))))
-
-    # run OCR on variants in order
-    for name, pimg in variants:
         try:
-            if OCR_AVAILABLE:
-                text = pytesseract.image_to_string(pimg, config=tesseract_config)
-                text_norm = normalize_ocr_text(text)
-                if text_norm and len(text_norm) > 2:
-                    return text_norm, name
-            else:
-                # OCR not available - skip
-                pass
+            import cv2
+            import numpy as np
+            bgr = cv2.cvtColor(np.array(big), cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            coords = cv2.findNonZero(cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY_INV)[1])
+            if coords is not None and len(coords) > 10:
+                angle = cv2.minAreaRect(coords)[-1]
+                if angle < -45:
+                    angle = -(90 + angle)
+                else:
+                    angle = -angle
+                (hcv, wcv) = bgr.shape[:2]
+                M = cv2.getRotationMatrix2D((wcv // 2, hcv // 2), angle, 1.0)
+                rotated = cv2.warpAffine(bgr, M, (wcv, hcv), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                variants.append(("cv_deskew", Image.fromarray(cv2.cvtColor(rotated, cv2.COLOR_BGR2RGB))))
         except Exception:
-            continue
+            pass
+
+    # If EasyOCR available, use it first across variants
+    if EASYOCR_AVAILABLE:
+        # create reader once and reuse
+        try:
+            # cache reader in module-level variable so we don't recreate often
+            global _easyocr_reader
+            if "_easyocr_reader" not in globals():
+                # create english-only CPU reader to keep resources small
+                _easyocr_reader = easyocr.Reader(["en"], gpu=False)
+            reader = _easyocr_reader
+        except Exception:
+            reader = None
+
+        if reader is not None:
+            for name, vimg in variants:
+                try:
+                    txt = easyocr_extract_text(reader, vimg)
+                    if txt and len(txt) > 2:
+                        return txt, f"easyocr_{name}"
+                except Exception:
+                    continue
+
+    # Fallback to pytesseract if available
+    if PYTESSERACT_AVAILABLE:
+        for name, vimg in variants:
+            try:
+                txt = pytess_extract_text(vimg)
+                if txt and len(txt) > 2:
+                    return txt, f"pytess_{name}"
+            except Exception:
+                continue
 
     return "", "none_found"
 
@@ -236,17 +269,24 @@ st.markdown("""
     .title {font-size:36px; font-weight:800; text-align:center; margin-bottom:6px; color: #0b6e4f;}
     .subtitle {text-align:center; color:#666; margin-top:-6px;}
     .panel {padding:16px; background:#fff; border-radius:8px; box-shadow: 0 6px 18px rgba(0,0,0,0.04);}
-    .result-box {border-radius:8px; padding:14px; border:2px solid #e6e6e6; background:#fbfffb;}
     </style>
 """, unsafe_allow_html=True)
 
 st.markdown("<div class='title'>📰 Fake News Detector</div>", unsafe_allow_html=True)
-st.markdown("<div class='subtitle'>Text prediction (TF-IDF → RandomForest). Optional image OCR when Tesseract is installed locally.</div>", unsafe_allow_html=True)
+st.markdown("<div class='subtitle'>Text prediction (TF-IDF → RandomForest). Optional image OCR when EasyOCR or Tesseract is available.</div>", unsafe_allow_html=True)
 st.write("")
 
 # artifact notice
 if model is None or vectorizer is None:
     st.warning("Model or vectorizer missing — place `news_model.pkl` and `vectorizer.pkl` in the app folder to enable predictions.")
+
+# show which OCR backend (if any) is enabled
+if OCR_BACKEND == "easyocr":
+    st.success("OCR backend: EasyOCR (enabled).")
+elif OCR_BACKEND == "pytesseract":
+    st.info("OCR backend: pytesseract (local).")
+else:
+    st.info("OCR not available on this system. To enable: add EasyOCR to requirements (for cloud) or install Tesseract locally (for local).")
 
 # session state keys
 if 'user_text' not in st.session_state:
@@ -254,19 +294,12 @@ if 'user_text' not in st.session_state:
 if 'last_message' not in st.session_state:
     st.session_state['last_message'] = None
 
-# clear callback (works via experimental_rerun to avoid inline set-after-initialization errors)
-def clear_text_callback():
-    st.session_state['user_text'] = ""
-    st.session_state['last_message'] = "Text cleared."
-    st.experimental_rerun()
-
 # Layout
 tab_text, tab_image = st.tabs(["📝 Text", "🖼 Image (OCR)"])
 
 with tab_text:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
     st.subheader("Enter News Text")
-    # place text area inside a placeholder so rerun clears it visually
     user_text = st.text_area("Paste news content here:", value=st.session_state.get('user_text', ""), key="user_text_area", height=160)
 
     col1, col2 = st.columns([1, 1])
@@ -296,7 +329,6 @@ with tab_text:
                     st.write(out["cleaned"])
     with col2:
         if st.button("Clear Text"):
-            # set state and rerun to clear widget properly
             st.session_state['user_text'] = ""
             st.session_state['last_message'] = "Text cleared."
             st.experimental_rerun()
@@ -309,32 +341,30 @@ with tab_text:
 with tab_image:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
     st.subheader("Upload news image (OCR)")
-    if not OCR_AVAILABLE:
-        st.info("OCR disabled: Tesseract not found in PATH. Install Tesseract locally to enable image OCR.")
+    if OCR_BACKEND is None:
+        st.info("OCR disabled: EasyOCR or Tesseract not available. To enable on cloud add EasyOCR to requirements.txt; to enable locally install Tesseract.")
     uploaded = st.file_uploader("Upload JPG/PNG (crop to headline for best results)", type=['jpg','jpeg','png'])
     if uploaded:
         try:
             pil_img = Image.open(BytesIO(uploaded.read())).convert("RGB")
             st.image(pil_img, caption="Uploaded image (preview)", use_column_width=True)
 
-            if OCR_AVAILABLE:
+            if OCR_BACKEND is not None:
                 if st.button("Extract & Predict from image"):
-                    with st.spinner("Running OCR variants (may take a moment)..."):
+                    with st.spinner("Running OCR (may take a moment)..."):
                         text_found, method = try_ocr_variants(pil_img)
                         if not text_found:
                             st.warning("No text was extracted after multiple preprocessing attempts. Try cropping headline and re-uploading.")
                         else:
-                            st.success(f"Text found using variant: {method}")
+                            st.success(f"Text found using: {method}")
                             st.write(text_found[:2000])
-                            # attempt prediction (repair tokens fuzzily if vectorizer available)
+                            # attempt fuzzy repair to model vocab if vectorizer exists
                             repaired_text = text_found
                             if vectorizer is not None:
-                                # fuzzy repair: map tokens to closest vocab words if helpful
                                 try:
                                     vocab_list = list(vectorizer.get_feature_names_out())
                                 except Exception:
                                     vocab_list = list(getattr(vectorizer, "vocabulary_", {}).keys())
-                                # simple fuzzy mapping for short OCR tokens
                                 def fuzzy_repair(s):
                                     toks = s.split()
                                     out_toks = []
@@ -351,8 +381,7 @@ with tab_image:
                             out = predict_with_checks(repaired_text)
                             if not out.get("ok"):
                                 st.warning(out.get("reason"))
-                                # offer force predict (if user understands risk)
-                                if st.button("Force predict anyway (use with caution)"):
+                                if st.button("Force predict anyway (use caution)"):
                                     if vectorizer is None or model is None:
                                         st.error("Model artifacts missing; cannot force predict.")
                                     else:
@@ -374,7 +403,7 @@ with tab_image:
                                 if prob is not None:
                                     st.write(f"Confidence: {prob:.2f}")
             else:
-                st.info("OCR is not available on this system. Install Tesseract and ensure `tesseract` is on PATH to enable image extraction.")
+                st.info("OCR backend not available. Add EasyOCR to requirements.txt (for cloud) or install Tesseract locally (for local OCR).")
         except Exception as e:
             st.error(f"Could not open/process image: {e}")
 
