@@ -297,10 +297,16 @@ if 'last_message' not in st.session_state:
 # Layout
 tab_text, tab_image = st.tabs(["📝 Text", "🖼 Image (OCR)"])
 
+
 with tab_text:
     st.markdown("<div class='panel'>", unsafe_allow_html=True)
     st.subheader("Enter News Text")
-    user_text = st.text_area("Paste news content here:", value=st.session_state.get('user_text', ""), key="user_text_area", height=160)
+    user_text = st.text_area(
+        "Paste news content here:",
+        value=st.session_state.get('user_text', ""),
+        key="user_text_area",
+        height=160
+    )
 
     col1, col2 = st.columns([1, 1])
     with col1:
@@ -320,9 +326,15 @@ with tab_text:
                     color = "#1b8b4a" if label == "REAL" else "#b02a2a"
                     low = out.get("low_confidence", False)
                     if low:
-                        st.markdown(f"### Prediction: <span style='color:{color}'>{label}</span> ⚠️ (low confidence)", unsafe_allow_html=True)
+                        st.markdown(
+                            f"### Prediction: <span style='color:{color}'>{label}</span> ⚠️ (low confidence)",
+                            unsafe_allow_html=True
+                        )
                     else:
-                        st.markdown(f"### Prediction: <span style='color:{color}'>{label}</span>", unsafe_allow_html=True)
+                        st.markdown(
+                            f"### Prediction: <span style='color:{color}'>{label}</span>",
+                            unsafe_allow_html=True
+                        )
                     if prob is not None:
                         st.write(f"Confidence: {prob:.2f}")
                     st.write("Cleaned Text:")
@@ -331,7 +343,7 @@ with tab_text:
         if st.button("Clear Text"):
             st.session_state['user_text'] = ""
             st.session_state['last_message'] = "Text cleared."
-            st.experimental_rerun()
+            st.rerun()
 
     if st.session_state.get('last_message'):
         st.success(st.session_state.pop('last_message'))
@@ -343,7 +355,7 @@ with tab_image:
     st.subheader("Upload news image (OCR)")
     if OCR_BACKEND is None:
         st.info("OCR disabled: EasyOCR or Tesseract not available. To enable on cloud add EasyOCR to requirements.txt; to enable locally install Tesseract.")
-    uploaded = st.file_uploader("Upload JPG/PNG (crop to headline for best results)", type=['jpg','jpeg','png'])
+    uploaded = st.file_uploader("Upload JPG/PNG (crop to headline for best results)", type=['jpg', 'jpeg', 'png'])
     if uploaded:
         try:
             pil_img = Image.open(BytesIO(uploaded.read())).convert("RGB")
@@ -365,6 +377,7 @@ with tab_image:
                                     vocab_list = list(vectorizer.get_feature_names_out())
                                 except Exception:
                                     vocab_list = list(getattr(vectorizer, "vocabulary_", {}).keys())
+
                                 def fuzzy_repair(s):
                                     toks = s.split()
                                     out_toks = []
@@ -375,6 +388,7 @@ with tab_image:
                                         matches = difflib.get_close_matches(t, vocab_list, n=1, cutoff=0.78)
                                         out_toks.append(matches[0] if matches else t)
                                     return " ".join(out_toks)
+
                                 repaired_text = fuzzy_repair(text_found)
                                 st.info("Attempted fuzzy repair to model vocabulary (may improve prediction).")
                             # predict
@@ -397,9 +411,15 @@ with tab_image:
                                 prob = out.get("prob")
                                 color = "#1b8b4a" if lbl == "REAL" else "#b02a2a"
                                 if out.get("low_confidence"):
-                                    st.markdown(f"### Prediction: <span style='color:{color}'>{lbl}</span> ⚠️ (Low confidence)", unsafe_allow_html=True)
+                                    st.markdown(
+                                        f"### Prediction: <span style='color:{color}'>{lbl}</span> ⚠️ (Low confidence)",
+                                        unsafe_allow_html=True
+                                    )
                                 else:
-                                    st.markdown(f"### Prediction: <span style='color:{color}'>{lbl}</span>", unsafe_allow_html=True)
+                                    st.markdown(
+                                        f"### Prediction: <span style='color:{color}'>{lbl}</span>",
+                                        unsafe_allow_html=True
+                                    )
                                 if prob is not None:
                                     st.write(f"Confidence: {prob:.2f}")
             else:
